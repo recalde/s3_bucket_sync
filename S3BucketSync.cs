@@ -40,7 +40,6 @@ class S3BucketSync
     private static readonly DateTime EndDate = DateTime.Now.AddDays(-1);
 
     private static readonly int MaxConcurrency = int.TryParse(Environment.GetEnvironmentVariable("MAX_CONCURRENCY"), out int concurrency) ? concurrency : 5;
-    private static readonly int ListConcurrency = int.TryParse(Environment.GetEnvironmentVariable("LIST_CONCURRENCY"), out int listConcurrency) ? listConcurrency : 50;
 
     private static AmazonS3Client sourceS3Client;
     private static AmazonS3Client destS3Client;
@@ -61,138 +60,101 @@ class S3BucketSync
             DateTime startDate = GetStartDate();
             DateTime endDate = GetEndDate();
 
-            // List all objects in both source and destination buckets before starting copies
-            Log("Listing all objects in source and destination buckets...");
-            var semaphore = new SemaphoreSlim(ListConcurrency);
-            var listTasks = new List<Task<(string BucketName, List<S3Object> Objects)>>();
-
-            for (int i = 0; i < SourceBuckets.Length; i++)
-            {
-                string sourceBucketName = SourceBuckets[i];
-                string destinationBucketName = DestinationBuckets[i];
-
-                await semaphore.WaitAsync();
-                listTasks.Add(Task.Run(async () =>
-                {
-                    try
-                    {
-                        List<S3Object> sourceObjects = await ListS3ObjectsWithCache(sourceS3Client, sourceBucketName);
-                        List<S3Object> destinationObjects = await ListS3Objects(destS3Client, destinationBucketName);
-                        return (sourceBucketName, sourceObjects);
-                    }
-                    finally
-                    {
-                        semaphore.Release();
-                    }
-                }));
-            }
-
-            var bucketListings = await Task.WhenAll(listTasks);
-
-            // Prepare program plan
-            long totalFilesToCopy = 0;
-            long totalSizeToCopy = 0;
-            var appSizeSummary = new Dictionary<string, (long FileCount, long TotalSize)>();
-
-            foreach (var (bucketName, sourceObjects) in bucketListings)
-            {
-                foreach (var obj in sourceObjects)
-                {
-                    totalFilesToCopy++;
-                    totalSizeToCopy += obj.Size;
-
-                    string appKey = ExtractAppKeyFromPath(obj.Key);
-                    if (!appSizeSummary.ContainsKey(appKey))
-                    {
-                        appSizeSummary[appKey] = (0, 0);
-                    }
-                    appSizeSummary[appKey] = (appSizeSummary[appKey].FileCount + 1, appSizeSummary[appKey].TotalSize + obj.Size);
-                }
-            }
-
-            // Print program plan
-            Log("Program Plan:");
-            Log($"Total files to copy: {totalFilesToCopy}");
-            Log($"Total size to copy: {FormatFileSize(totalSizeToCopy)}");
-            Log("Summary by Application:");
-            foreach (var app in appSizeSummary)
-            {
-                Log($"{app.Key}: {app.Value.FileCount} files, {FormatFileSize(app.Value.TotalSize)}");
-            }
-
-            // Start the copying process
+            // Loop over each date prefix
             for (DateTime date = startDate; date <= endDate; date = date.AddDays(1))
             {
                 string datePrefix = date.ToString("yyyyMMdd");
                 Log($"Processing date: {datePrefix}");
 
-                for (int i = 0; i < SourceBuckets.Length; i++)
+                foreach (var bucketName in SourceBuckets)
                 {
-                    string sourceBucketName = SourceBuckets[i];
-                    string destinationBucketName = DestinationBuckets[i];
                     DateTime startTime = DateTime.Now;
 
-                    try
+                    // List objects in source bucket
+                    List<S3Object> sourceObjects = await ListS3Objects(sourceS3Client, bucketName, datePrefix);
+                    long totalSourceSize = sourceObjects.Sum(obj => obj.Size);
+
+                    // Filter objects by SourceApp if applicable
+                    if (SourceApps.Length > 0)
                     {
-                        // List objects in source bucket
-                        List<S3Object> sourceObjects = await ListS3ObjectsWithCache(sourceS3Client, sourceBucketName, datePrefix);
-                        long totalSourceSize = sourceObjects.Sum(obj => obj.Size);
+                        sourceObjects = sourceObjects.Where(obj => SourceApps.Any(app => obj.Key.Contains($"/{app}/"))).ToList();
+                    }
 
-                        // Filter objects by SourceApp if applicable
-                        if (SourceApps.Length > 0)
+                    // List objects in destination bucket
+                    string destinationBucketName = DestinationBuckets.FirstOrDefault() ?? bucketName;
+                    List<S3Object> destinationObjects = await ListS3Objects(destS3Client, destinationBucketName, datePrefix);
+
+                    // Compare directories and identify files to copy
+                    var filesToCopy = CompareDirectories(sourceObjects, destinationObjects);
+                    long remainingSize = filesToCopy.Sum(obj => obj.Size);
+                    int totalFilesToCopy = filesToCopy.Count;
+
+                    Log($"Total files in source: {sourceObjects.Count}, Total size: {FormatFileSize(totalSourceSize)}");
+                    Log($"Remaining files to copy: {totalFilesToCopy}, Remaining size: {FormatFileSize(remainingSize)}");
+
+                    // Copy files with limited concurrency
+                    var semaphore = new SemaphoreSlim(MaxConcurrency);
+                    var tasks = new List<Task>();
+                    foreach (var file in filesToCopy)
+                    {
+                        await semaphore.WaitAsync();
+                        tasks.Add(Task.Run(async () =>
                         {
-                            sourceObjects = sourceObjects.Where(obj => SourceApps.Any(app => obj.Key.Contains($"/{app}/"))).ToList();
-                        }
-
-                        // List objects in destination bucket
-                        List<S3Object> destinationObjects = await ListS3Objects(destS3Client, destinationBucketName, datePrefix);
-
-                        // Compare directories and identify files to copy
-                        var filesToCopy = CompareDirectories(sourceObjects, destinationObjects);
-                        long remainingSize = filesToCopy.Sum(obj => obj.Size);
-                        int totalFilesToCopyForDate = filesToCopy.Count;
-
-                        Log($"Total files in source: {sourceObjects.Count}, Total size: {FormatFileSize(totalSourceSize)}");
-                        Log($"Remaining files to copy: {totalFilesToCopyForDate}, Remaining size: {FormatFileSize(remainingSize)}");
-
-                        // Copy files with limited concurrency
-                        var copySemaphore = new SemaphoreSlim(MaxConcurrency);
-                        var tasks = new List<Task>();
-                        foreach (var file in filesToCopy)
-                        {
-                            await copySemaphore.WaitAsync();
-                            tasks.Add(Task.Run(async () =>
+                            try
                             {
-                                try
+                                if (FileCopyMode.Equals("memory", StringComparison.OrdinalIgnoreCase))
                                 {
-                                    if (FileCopyMode.Equals("memory", StringComparison.OrdinalIgnoreCase))
-                                    {
-                                        await CopyFileInMemory(sourceS3Client, destS3Client, file, destinationBucketName);
-                                    }
-                                    else if (FileCopyMode.Equals("disk", StringComparison.OrdinalIgnoreCase))
-                                    {
-                                        await CopyFileToDisk(sourceS3Client, destS3Client, file, destinationBucketName);
-                                    }
+                                    await CopyFileInMemory(sourceS3Client, destS3Client, file, destinationBucketName);
                                 }
-                                catch (Exception ex)
+                                else if (FileCopyMode.Equals("disk", StringComparison.OrdinalIgnoreCase))
                                 {
-                                    Log($"Error copying file {file.Key}: {ex.Message}");
+                                    await CopyFileToDisk(sourceS3Client, destS3Client, file, destinationBucketName);
                                 }
-                                finally
-                                {
-                                    copySemaphore.Release();
-                                }
-                            }));
-                        }
-
-                        await Task.WhenAll(tasks);
-
-                        Log($"Completed copying for date: {datePrefix} in bucket: {sourceBucketName}");
+                            }
+                            finally
+                            {
+                                semaphore.Release();
+                            }
+                        }));
                     }
-                    catch (Exception ex)
+
+                    int filesCopied = 0;
+                    long copiedSize = 0;
+                    System.Timers.Timer progressTimer = new System.Timers.Timer(1000);
+                    progressTimer.Elapsed += (sender, e) =>
                     {
-                        Log($"Error processing bucket: {sourceBucketName} for date: {datePrefix}: {ex.Message}");
+                        TimeSpan elapsedTime = DateTime.Now - startTime;
+                        Console.Write($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] \rProgress: {filesCopied}/{totalFilesToCopy} files copied, {FormatFileSize(copiedSize)}/{FormatFileSize(remainingSize)} copied, Elapsed: {elapsedTime:hh\:mm\:ss}");
+                    };
+                    progressTimer.Start();
+
+                    await Task.WhenAll(tasks);
+                    filesCopied = filesToCopy.Count;
+                    copiedSize = filesToCopy.Sum(file => file.Size);
+
+                    progressTimer.Stop();
+                    Console.Write($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] \rProgress: {filesCopied}/{totalFilesToCopy} files copied, {FormatFileSize(copiedSize)}/{FormatFileSize(remainingSize)} copied\n");
+
+                    // Double-check directory listings to verify all files were copied
+                    var updatedSourceObjects = await ListS3Objects(sourceS3Client, bucketName, datePrefix);
+                    if (SourceApps.Length > 0)
+                    {
+                        updatedSourceObjects = updatedSourceObjects.Where(obj => SourceApps.Any(app => obj.Key.Contains($"/{app}/"))).ToList();
                     }
+                    var updatedDestinationObjects = await ListS3Objects(destS3Client, destinationBucketName, datePrefix);
+
+                    if (ValidateCopy(updatedSourceObjects, updatedDestinationObjects))
+                    {
+                        Log($"Successfully copied all files for date: {datePrefix} in bucket: {bucketName}");
+                    }
+                    else
+                    {
+                        Log($"Error: Mismatch in copied files for date: {datePrefix} in bucket: {bucketName}");
+                    }
+
+                    DateTime endTime = DateTime.Now;
+                    TimeSpan duration = endTime - startTime;
+                    Log($"Completed copying for date: {datePrefix} in bucket: {bucketName}. Duration: {duration}, Total files copied: {totalFilesToCopy}, Total size copied: {FormatFileSize(remainingSize)}");
                 }
             }
         }
@@ -225,7 +187,7 @@ class S3BucketSync
     }
 
     // Lists objects in the given S3 bucket with a specific prefix (date)
-    private static async Task<List<S3Object>> ListS3Objects(AmazonS3Client s3Client, string bucketName, string datePrefix = null)
+    private static async Task<List<S3Object>> ListS3Objects(AmazonS3Client s3Client, string bucketName, string datePrefix)
     {
         var request = new ListObjectsV2Request
         {
@@ -238,17 +200,6 @@ class S3BucketSync
         return response.S3Objects;
     }
 
-    // Lists objects in the given S3 bucket, checking for a cached file first
-    private static async Task<List<S3Object>> ListS3ObjectsWithCache(AmazonS3Client s3Client, string bucketName, string datePrefix = null)
-    {
-        string cacheFileName = $"{bucketName}_{datePrefix}_listing.txt";
-        if (File.Exists(cacheFileName))
-        {
-            return LoadDirectoryListing(cacheFileName);
-        }
-        return await ListS3Objects(s3Client, bucketName, datePrefix);
-    }
-
     // Saves the directory listing of the objects in the bucket to a file
     private static void SaveDirectoryListing(string bucketName, string datePrefix, List<S3Object> objects)
     {
@@ -257,33 +208,9 @@ class S3BucketSync
         {
             foreach (var obj in objects)
             {
-                writer.WriteLine($"{obj.Key},{obj.LastModified:yyyy-MM-dd HH:mm:ss},{obj.Size}");
+                writer.WriteLine($"{obj.Key}, {obj.LastModified:yyyy-MM-dd HH:mm:ss}, {FormatFileSize(obj.Size)}");
             }
         }
-    }
-
-    // Loads the directory listing from a file
-    private static List<S3Object> LoadDirectoryListing(string fileName)
-    {
-        var objects = new List<S3Object>();
-        using (var reader = new StreamReader(fileName))
-        {
-            string line;
-            while ((line = reader.ReadLine()) != null)
-            {
-                var parts = line.Split(',');
-                if (parts.Length >= 3 && long.TryParse(parts[2], out long size))
-                {
-                    objects.Add(new S3Object
-                    {
-                        Key = parts[0],
-                        LastModified = DateTime.Parse(parts[1]),
-                        Size = size
-                    });
-                }
-            }
-        }
-        return objects;
     }
 
     // Compares source and destination objects and identifies which files need to be copied
@@ -360,11 +287,11 @@ class S3BucketSync
         }
     }
 
-    // Extracts the application key from the file path
-    private static string ExtractAppKeyFromPath(string path)
+    // Validates that all files were successfully copied by comparing source and destination listings
+    private static bool ValidateCopy(List<S3Object> sourceObjects, List<S3Object> destinationObjects)
     {
-        var parts = path.Split('/');
-        return parts.Length > 1 ? parts[1] : "unknown";
+        var destinationKeys = new HashSet<string>(destinationObjects.Select(obj => obj.Key));
+        return sourceObjects.All(obj => destinationKeys.Contains(obj.Key));
     }
 
     // Formats file size in a human-readable format
